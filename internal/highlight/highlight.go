@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/somewearlabs/chainsaw/internal/config"
+	"github.com/RobertsMattL/chainsaw/internal/config"
 )
 
 type Engine struct {

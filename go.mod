@@ -1,4 +1,4 @@
-module github.com/somewearlabs/chainsaw
+module github.com/RobertsMattL/chainsaw
 
 go 1.22
 

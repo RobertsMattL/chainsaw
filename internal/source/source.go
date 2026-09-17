@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/nxadm/tail"
-	"github.com/somewearlabs/chainsaw/internal/config"
+	"github.com/RobertsMattL/chainsaw/internal/config"
 )
 
 type Line struct {
@@ -55,6 +55,18 @@ func Start(ctx context.Context, lc *config.LogConfig) (<-chan Line, error) {
 				label = cmdLabel(s.Command)
 			}
 			fns = append(fns, func() { runCommand(ctx, s.Command, label, out) })
+		case "ssh":
+			if s.Host == "" {
+				return nil, fmt.Errorf("ssh source requires a host")
+			}
+			if s.Command == "" {
+				return nil, fmt.Errorf("ssh source requires a command")
+			}
+			label := s.Label
+			if label == "" {
+				label = s.Host
+			}
+			fns = append(fns, func() { runSSH(ctx, s.Host, s.Command, label, out) })
 		default:
 			return nil, fmt.Errorf("unknown source type %q", s.Type)
 		}
@@ -211,6 +223,70 @@ func cmdLabel(command string) string {
 		return "cmd"
 	}
 	return filepath.Base(parts[0])
+}
+
+func runSSH(ctx context.Context, host, command, label string, out chan<- Line) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		err := streamSSH(ctx, host, command, label, out)
+		if err == nil {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		select {
+		case out <- Line{Label: label, Content: fmt.Sprintf("[ssh exited: %v — restarting in 5s]", err), IsErr: true}:
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case <-time.After(5 * time.Second):
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func streamSSH(ctx context.Context, host, command, label string, out chan<- Line) error {
+	cmd := exec.CommandContext(ctx, "ssh",
+		"-o", "ConnectTimeout=10",
+		"-o", "ServerAliveInterval=30",
+		"-o", "ServerAliveCountMax=3",
+		"-o", "BatchMode=yes",
+		host, command,
+	)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	streamLines := func(r io.Reader, isErr bool) {
+		sc := bufio.NewScanner(r)
+		for sc.Scan() {
+			select {
+			case out <- Line{Label: label, Content: sc.Text(), IsErr: isErr}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+
+	go streamLines(stdout, false)
+	go streamLines(stderr, true)
+
+	return cmd.Wait()
 }
 
 func homeDir() (string, error) {

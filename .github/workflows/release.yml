@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    name: Build and release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          targets=(
+            "darwin/amd64"
+            "darwin/arm64"
+            "linux/amd64"
+            "linux/arm64"
+            "linux/arm"
+          )
+          for target in "${targets[@]}"; do
+            OS="${target%/*}"
+            ARCH="${target#*/}"
+            NAME="chainsaw-${OS}-${ARCH}"
+            echo "Building $NAME..."
+            GOOS=$OS GOARCH=$ARCH CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/RobertsMattL/chainsaw/cmd.version=${{ github.ref_name }}" -o "dist/$NAME" .
+          done
+          ls -lh dist/
+
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum * > checksums.txt && cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*
+          generate_release_notes: true

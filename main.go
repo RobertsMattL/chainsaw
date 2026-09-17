@@ -1,6 +1,6 @@
 package main
 
-import "github.com/somewearlabs/chainsaw/cmd"
+import "github.com/RobertsMattL/chainsaw/cmd"
 
 func main() {
 	cmd.Execute()

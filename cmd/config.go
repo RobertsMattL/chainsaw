@@ -9,7 +9,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/somewearlabs/chainsaw/internal/config"
+	"github.com/RobertsMattL/chainsaw/internal/config"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -128,14 +128,14 @@ var configAddCmd = &cobra.Command{
 
 		fmt.Println()
 		fmt.Println(cfgDimStyle.Render("Add sources. Enter an empty line when done."))
-		fmt.Println(cfgDimStyle.Render("Source types: file (path or glob), command (shell command)"))
+		fmt.Println(cfgDimStyle.Render("Source types: file (path or glob), command (shell command), ssh (remote tail)"))
 		fmt.Println()
 
 		for i := 1; ; i++ {
 			fmt.Printf(cfgDimStyle.Render("Source %d\n"), i)
-			sourceType := promptDefault("  Type [file/command]: ", "file")
+			sourceType := promptDefault("  Type [file/command/ssh]: ", "file")
 			sourceType = strings.ToLower(sourceType)
-			if sourceType != "file" && sourceType != "command" {
+			if sourceType != "file" && sourceType != "command" && sourceType != "ssh" {
 				sourceType = "file"
 			}
 
@@ -162,6 +162,22 @@ var configAddCmd = &cobra.Command{
 						continue
 					}
 					goto done
+				}
+			case "ssh":
+				s.Host = prompt("  Host (user@host or IP): ")
+				if s.Host == "" {
+					if i == 1 {
+						fmt.Println(cfgErrStyle.Render("At least one source is required."))
+						i--
+						continue
+					}
+					goto done
+				}
+				s.Command = prompt("  Remote command: ")
+				if s.Command == "" {
+					fmt.Println(cfgErrStyle.Render("Remote command cannot be empty."))
+					i--
+					continue
 				}
 			}
 

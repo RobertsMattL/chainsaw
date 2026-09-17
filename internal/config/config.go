@@ -22,9 +22,10 @@ type LogConfig struct {
 }
 
 type Source struct {
-	Type    string `yaml:"type"`              // "file" or "command"
+	Type    string `yaml:"type"`              // "file", "command", or "ssh"
 	Path    string `yaml:"path,omitempty"`    // file type: path or glob
-	Command string `yaml:"command,omitempty"` // command type: shell command
+	Command string `yaml:"command,omitempty"` // command/ssh type: shell command (run locally or on remote)
+	Host    string `yaml:"host,omitempty"`    // ssh type: user@host
 	Label   string `yaml:"label,omitempty"`   // display label for this source
 }
 

@@ -8,7 +8,7 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/somewearlabs/chainsaw/internal/config"
+	"github.com/RobertsMattL/chainsaw/internal/config"
 )
 
 // SelectConfig runs an interactive TUI to pick a log config.

@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/RobertsMattL/chainsaw/internal/config"
 	"github.com/RobertsMattL/chainsaw/internal/highlight"
+	"github.com/RobertsMattL/chainsaw/internal/history"
 	"github.com/RobertsMattL/chainsaw/internal/source"
 )
 
@@ -29,7 +30,7 @@ type WatchConfig struct {
 // RunWatcher starts the interactive TUI watcher.
 func RunWatcher(cfg WatchConfig) error {
 	m := newWatchModel(cfg)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := p.Run()
 	return err
 }
@@ -64,27 +65,42 @@ type watchModel struct {
 	lines    []storedLine
 	filtered []int // indices into lines that match the active filter
 
-	viewport  viewport.Model
-	input     textinput.Model
-	viewBuf   *strings.Builder // pointer avoids copy-by-value panic
+	viewport viewport.Model
+	input    textinput.Model
+	viewBuf  *strings.Builder
 
 	ready     bool
 	width     int
 	height    int
-	filtering bool   // filter bar is open
-	filter    string // active filter (live as user types)
+	filtering bool
+	filter    string // active filter
+	filterRe  *regexp.Regexp
+	filterErr bool // filter looks like regex but has a syntax error
 	atBottom  bool
 	done      bool
+
+	history     *history.History
+	histMatches []string // fuzzy-filtered history entries
+	histCursor  int      // -1 = typing; 0+ = index into histMatches (0=most recent)
+	typedFilter string   // saved input before navigating history
 }
 
 func newWatchModel(cfg WatchConfig) watchModel {
 	ti := textinput.New()
-	ti.Placeholder = "type to filter…"
+	ti.Placeholder = "filter or /regex/…"
 	ti.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
 	ti.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	ti.Cursor.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
 	ti.Prompt = "/ "
-	return watchModel{cfg: cfg, input: ti, atBottom: true, viewBuf: &strings.Builder{}}
+	h := history.Load()
+	return watchModel{
+		cfg:        cfg,
+		input:      ti,
+		atBottom:   true,
+		viewBuf:    &strings.Builder{},
+		history:    h,
+		histCursor: -1,
+	}
 }
 
 func (m watchModel) Init() tea.Cmd {
@@ -131,7 +147,7 @@ func (m watchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		needFullRebuild := len(m.lines) >= maxStoredLines
 		if needFullRebuild {
 			m.lines = m.lines[1:]
-			m.refilter() // rebuilds filtered + viewBuf after drop
+			m.refilter()
 		}
 
 		m.lines = append(m.lines, ll)
@@ -171,9 +187,13 @@ func (m watchModel) updateNormal(msg tea.KeyMsg, cmds []tea.Cmd) (tea.Model, tea
 		m.input.SetValue(m.filter)
 		m.input.CursorEnd()
 		m.input.Focus()
+		m.typedFilter = m.filter
+		m.histCursor = -1
+		m.updateHistMatches()
+		m.rebuildViewport()
 	case "esc":
 		if m.filter != "" {
-			m.filter = ""
+			m.setFilter("")
 			m.input.SetValue("")
 			m.refilter()
 			m.rebuildViewport()
@@ -200,23 +220,68 @@ func (m watchModel) updateFiltering(msg tea.KeyMsg, cmds []tea.Cmd) (tea.Model, 
 	case "enter":
 		m.filtering = false
 		m.input.Blur()
-		// filter already up to date from live typing; commit it
+		if m.filter != "" {
+			m.history.Add(m.filter)
+		}
+		m.histCursor = -1
+		m.rebuildViewport()
+
 	case "esc":
 		m.filtering = false
 		m.input.Blur()
-		// esc: clear the filter
-		m.filter = ""
+		m.histCursor = -1
+		m.setFilter("")
 		m.input.SetValue("")
 		m.refilter()
 		m.rebuildViewport()
+
 	case "ctrl+c":
 		return m, tea.Quit
+
+	case "up":
+		if len(m.histMatches) == 0 {
+			break
+		}
+		if m.histCursor == -1 {
+			m.typedFilter = m.input.Value()
+		}
+		if m.histCursor < len(m.histMatches)-1 {
+			m.histCursor++
+		}
+		sel := m.histMatches[m.histCursor]
+		m.input.SetValue(sel)
+		m.input.CursorEnd()
+		m.setFilter(sel)
+		m.refilter()
+		m.rebuildViewport()
+
+	case "down":
+		if m.histCursor < 0 {
+			break
+		}
+		m.histCursor--
+		if m.histCursor < 0 {
+			m.input.SetValue(m.typedFilter)
+			m.input.CursorEnd()
+			m.setFilter(m.typedFilter)
+		} else {
+			sel := m.histMatches[m.histCursor]
+			m.input.SetValue(sel)
+			m.input.CursorEnd()
+			m.setFilter(sel)
+		}
+		m.refilter()
+		m.rebuildViewport()
+
 	default:
 		var inputCmd tea.Cmd
 		m.input, inputCmd = m.input.Update(msg)
 		cmds = append(cmds, inputCmd)
 		if v := m.input.Value(); v != m.filter {
-			m.filter = v
+			m.histCursor = -1
+			m.typedFilter = v
+			m.setFilter(v)
+			m.updateHistMatches()
 			m.refilter()
 			m.rebuildViewport()
 		}
@@ -226,9 +291,31 @@ func (m watchModel) updateFiltering(msg tea.KeyMsg, cmds []tea.Cmd) (tea.Model, 
 
 // — filter helpers —
 
+func (m *watchModel) setFilter(f string) {
+	m.filter = f
+	m.filterRe = nil
+	m.filterErr = false
+	if f != "" && containsRegexMeta(f) {
+		if re, err := regexp.Compile(f); err == nil {
+			m.filterRe = re
+		} else {
+			m.filterErr = true
+		}
+	}
+}
+
+func containsRegexMeta(s string) bool {
+	return strings.ContainsAny(s, `[\](){}^$.|*+?`)
+}
+
 func (m *watchModel) matches(raw string) bool {
-	return m.filter == "" ||
-		strings.Contains(strings.ToLower(raw), strings.ToLower(m.filter))
+	if m.filter == "" {
+		return true
+	}
+	if m.filterRe != nil {
+		return m.filterRe.MatchString(raw)
+	}
+	return strings.Contains(strings.ToLower(raw), strings.ToLower(m.filter))
 }
 
 func (m *watchModel) refilter() {
@@ -240,6 +327,58 @@ func (m *watchModel) refilter() {
 			m.writeLine(ll)
 		}
 	}
+}
+
+// — history helpers —
+
+func (m *watchModel) updateHistMatches() {
+	if m.history == nil {
+		m.histMatches = nil
+		return
+	}
+	needle := strings.ToLower(m.typedFilter)
+	if needle == "" {
+		m.histMatches = make([]string, len(m.history.Entries))
+		copy(m.histMatches, m.history.Entries)
+		return
+	}
+	m.histMatches = m.histMatches[:0]
+	for _, e := range m.history.Entries {
+		if fuzzyMatch(needle, strings.ToLower(e)) {
+			m.histMatches = append(m.histMatches, e)
+		}
+	}
+}
+
+// fuzzyMatch returns true if all runes of needle appear in haystack in order.
+func fuzzyMatch(needle, haystack string) bool {
+	hi := 0
+	hay := []rune(haystack)
+	for _, ch := range needle {
+		found := false
+		for ; hi < len(hay); hi++ {
+			if hay[hi] == ch {
+				hi++
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func (m watchModel) histDisplayCount() int {
+	if !m.filtering {
+		return 0
+	}
+	n := len(m.histMatches)
+	if n > 5 {
+		n = 5
+	}
+	return n
 }
 
 // — viewport helpers —
@@ -259,6 +398,7 @@ func (m *watchModel) rebuildViewport() {
 	if !m.ready {
 		return
 	}
+	m.viewport.Height = m.vpHeight()
 	m.viewport.SetContent(m.viewBuf.String())
 	if m.atBottom {
 		m.viewport.GotoBottom()
@@ -266,8 +406,8 @@ func (m *watchModel) rebuildViewport() {
 }
 
 func (m watchModel) vpHeight() int {
-	// header: 2 lines, footer: 2 lines
-	h := m.height - 4
+	// header: 2 lines, footer separator+input: 2 lines, history items
+	h := m.height - 4 - m.histDisplayCount()
 	if h < 1 {
 		return 1
 	}
@@ -290,7 +430,13 @@ var (
 	watchSepStyle    = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("237"))
 	watchHelpStyle   = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("244"))
 	watchFilterBadge = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
+	watchFilterReBadge = lipgloss.NewStyle().Foreground(lipgloss.Color("86"))
+	watchFilterErrBadge = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	watchDoneStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+
+	histEntryStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	histSelectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Bold(true)
+	histHintStyle     = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("240"))
 )
 
 func (m watchModel) headerView() string {
@@ -298,7 +444,14 @@ func (m watchModel) headerView() string {
 	title := watchTitleStyle.Render("⛓") + "  " + tag
 
 	if m.filter != "" {
-		badge := watchFilterBadge.Render(" ~" + m.filter + "~")
+		var badge string
+		if m.filterErr {
+			badge = watchFilterErrBadge.Render(" ~[!re] " + m.filter + "~")
+		} else if m.filterRe != nil {
+			badge = watchFilterReBadge.Render(" ~[re] " + m.filter + "~")
+		} else {
+			badge = watchFilterBadge.Render(" ~" + m.filter + "~")
+		}
 		title += badge
 	}
 
@@ -317,14 +470,42 @@ func (m watchModel) footerView() string {
 
 	var bar string
 	if m.filtering {
-		bar = m.input.View()
+		var sb strings.Builder
+
+		// History items: render in reverse so most recent (index 0) is closest to input.
+		shown := m.histDisplayCount()
+		for i := shown - 1; i >= 0; i-- {
+			e := m.histMatches[i]
+			display := truncate(e, m.width-4)
+			if i == m.histCursor {
+				sb.WriteString(histSelectedStyle.Render(" > " + display))
+			} else {
+				sb.WriteString(histEntryStyle.Render("   " + display))
+			}
+			sb.WriteByte('\n')
+		}
+
+		sb.WriteString(m.input.View())
+		if m.filterErr {
+			sb.WriteString("  " + watchFilterErrBadge.Render("[invalid regex]"))
+		} else if m.filterRe != nil {
+			sb.WriteString("  " + watchFilterReBadge.Render("[regex]"))
+		} else if len(m.history.Entries) == 0 {
+			sb.WriteString("  " + histHintStyle.Render("↑ history (Enter to save)"))
+		} else if len(m.histMatches) == 0 && m.typedFilter != "" {
+			sb.WriteString("  " + histHintStyle.Render("no history matches"))
+		}
+		bar = sb.String()
 	} else {
 		var parts []string
 		if m.filter != "" {
-			parts = append(parts,
-				watchHelpStyle.Render("/=edit"),
-				watchHelpStyle.Render("esc=clear"),
-			)
+			filterDisplay := watchFilterBadge.Render("/ ") + watchFilterBadge.Render(truncate(m.filter, 40))
+			if m.filterRe != nil {
+				filterDisplay = watchFilterReBadge.Render("/ ") + watchFilterReBadge.Render(truncate(m.filter, 40))
+			} else if m.filterErr {
+				filterDisplay = watchFilterErrBadge.Render("/ ") + watchFilterErrBadge.Render(truncate(m.filter, 40))
+			}
+			parts = append(parts, filterDisplay, watchHelpStyle.Render("esc=clear  /=edit"))
 		} else {
 			parts = append(parts, watchHelpStyle.Render("/=filter"))
 		}
@@ -339,4 +520,11 @@ func (m watchModel) footerView() string {
 	}
 
 	return "\n" + sep + "\n" + bar
+}
+
+func truncate(s string, max int) string {
+	if max < 4 || len(s) <= max {
+		return s
+	}
+	return s[:max-1] + "…"
 }

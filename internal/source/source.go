@@ -116,13 +116,24 @@ func resolveGlob(pattern string) ([]string, error) {
 	return matches, nil
 }
 
+const lookbackBytes = 512 * 1024 // read up to ~512KB of existing content before tailing
+
+func seekLocation(path string) *tail.SeekInfo {
+	fi, err := os.Stat(path)
+	if err != nil || fi.Size() <= lookbackBytes {
+		return &tail.SeekInfo{Offset: 0, Whence: io.SeekStart}
+	}
+	return &tail.SeekInfo{Offset: fi.Size() - lookbackBytes, Whence: io.SeekStart}
+}
+
 func tailFile(ctx context.Context, path, label string, out chan<- Line) {
+	loc := seekLocation(path)
 	t, err := tail.TailFile(path, tail.Config{
 		Follow:    true,
 		ReOpen:    true, // handle log rotation
 		MustExist: false,
 		Poll:      true, // use polling for cross-platform compat
-		Location:  &tail.SeekInfo{Offset: 0, Whence: io.SeekEnd},
+		Location:  loc,
 	})
 	if err != nil {
 		select {
